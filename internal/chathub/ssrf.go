@@ -7,6 +7,13 @@ import (
 	"strings"
 )
 
+// ValidateRemoteDownloadURL blocks SSRF: only https and public routable
+// addresses are accepted, with a lookup-time recheck against private,
+// loopback, link-local and cloud metadata ranges.
+func ValidateRemoteDownloadURL(raw string) error {
+	return validateRemoteDownloadURL(raw)
+}
+
 // validateRemoteDownloadURL blocks SSRF: only https and public routable
 // addresses are accepted, with a lookup-time recheck against private,
 // loopback, link-local and cloud metadata ranges.

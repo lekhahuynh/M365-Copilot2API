@@ -334,9 +334,61 @@ func (s *Server) designerAccessToken(acc auth.AccountToken) (string, error) {
 	return set.AccessToken, nil
 }
 
-func isDesignerImageURL(raw string) bool {
+var trustedMicrosoftImageHosts = []string{
+	"officeapps.live.com",
+	"substrate.office.com",
+	"m365.cloud.microsoft",
+	"copilot.cloud.microsoft",
+	"copilot.microsoft.com",
+}
+
+func hasTrustedHTTPSHost(raw string, allowedHosts []string, allowSubdomains bool) bool {
 	u, err := url.Parse(raw)
-	return err == nil && strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Hostname(), "designerapp.officeapps.live.com")
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.User != nil {
+		return false
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		return false
+	}
+	for _, allowed := range allowedHosts {
+		if host == allowed || (allowSubdomains && strings.HasSuffix(host, "."+allowed)) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDesignerImageURL(raw string) bool {
+	return hasTrustedHTTPSHost(raw, []string{"designerapp.officeapps.live.com"}, false)
+}
+
+func isTrustedMicrosoftImageURL(raw string) bool {
+	return hasTrustedHTTPSHost(raw, trustedMicrosoftImageHosts, true)
+}
+
+func readImageBody(resp *http.Response, source string) ([]byte, string, error) {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("%s image download HTTP %d", source, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGeneratedImageBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(body) > maxGeneratedImageBytes {
+		return nil, "", fmt.Errorf("generated image exceeds %d bytes", maxGeneratedImageBytes)
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
+		contentType = http.DetectContentType(body)
+	}
+	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
+		return nil, "", fmt.Errorf("%s returned non-image content", source)
+	}
+	return body, contentType, nil
 }
 
 func downloadDesignerImage(ctx context.Context, rawURL, accessToken string) ([]byte, string, error) {
@@ -361,24 +413,7 @@ func downloadDesignerImage(ctx context.Context, rawURL, accessToken string) ([]b
 		return nil, "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("Designer image download HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGeneratedImageBytes+1))
-	if err != nil {
-		return nil, "", err
-	}
-	if len(body) > maxGeneratedImageBytes {
-		return nil, "", fmt.Errorf("generated image exceeds %d bytes", maxGeneratedImageBytes)
-	}
-	contentType := resp.Header.Get("Content-Type")
-	if contentType == "" || !strings.HasPrefix(strings.ToLower(contentType), "image/") {
-		contentType = http.DetectContentType(body)
-	}
-	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
-		return nil, "", fmt.Errorf("Designer returned non-image content")
-	}
-	return body, contentType, nil
+	return readImageBody(resp, "Designer")
 }
 
 func (s *Server) storeGeneratedImage(data []byte, contentType string) string {
@@ -504,38 +539,77 @@ func extractImageURLs(raw string) []string {
 	return out
 }
 
-func downloadImageAsBase64(url string) (b64, contentType string, err error) {
-	return downloadImageAsBase64WithToken(url, "")
+func downloadImageAsBase64(rawURL string) (b64, contentType string, err error) {
+	return downloadImageAsBase64WithToken(rawURL, "")
 }
 
-func downloadImageAsBase64WithToken(url, token string) (b64, contentType string, err error) {
+func downloadImageAsBase64WithToken(rawURL, token string) (b64, contentType string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	return downloadImageAsBase64WithClient(ctx, outbound.HTTPClient(), chathub.ValidateRemoteDownloadURL, rawURL, token)
+}
+
+func downloadImageAsBase64WithClient(
+	ctx context.Context,
+	baseClient *http.Client,
+	validateURL func(string) error,
+	rawURL, token string,
+) (b64, contentType string, err error) {
+	trustedHost := isTrustedMicrosoftImageURL(rawURL)
+	if !trustedHost && validateURL != nil {
+		if err := validateURL(rawURL); err != nil {
+			return "", "", err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", "", err
 	}
-	if token != "" {
+	sendAuth := token != "" && trustedHost
+	if sendAuth {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Accept", "image/*")
+
+	if baseClient == nil {
+		baseClient = outbound.HTTPClient()
+	}
+	client := *baseClient
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		nextURL := next.URL.String()
+		if sendAuth {
+			// Auth-bearing image fetches must never follow redirects off trusted
+			// Microsoft hosts or carry credentials across redirect chains.
+			if len(via) >= 3 || !isTrustedMicrosoftImageURL(nextURL) {
+				return http.ErrUseLastResponse
+			}
+			if len(via) > 0 && !strings.EqualFold(next.URL.Hostname(), via[0].URL.Hostname()) {
+				next.Header.Del("Authorization")
+			}
+			return nil
+		}
+		next.Header.Del("Authorization")
+		if len(via) >= 5 {
+			return fmt.Errorf("image download: too many redirects")
+		}
+		if !isTrustedMicrosoftImageURL(nextURL) && validateURL != nil {
+			if err := validateURL(nextURL); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("download returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20))
+	body, ct, err := readImageBody(resp, "remote")
 	if err != nil {
 		return "", "", err
 	}
-	ct := resp.Header.Get("Content-Type")
-	if ct == "" {
-		ct = http.DetectContentType(body)
-	}
-	enc := base64.StdEncoding.EncodeToString(body)
-	return enc, ct, nil
+	return base64.StdEncoding.EncodeToString(body), ct, nil
 }
 
 func downloadImageAsDataURI(url string) (string, error) {
